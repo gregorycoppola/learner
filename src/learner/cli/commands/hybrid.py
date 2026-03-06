@@ -97,7 +97,10 @@ def cmd_run(args):
 
                 elif event["type"] == "done":
                     print()
-                    print(f"Done.  Best val acc: {best_val:.1%}  at epoch {best_epoch}")
+                    if event.get("stopped_early"):
+                        print(f"✓ Solved in {event['epoch']} epochs — val acc 100%")
+                    else:
+                        print(f"Done.  Best val acc: {best_val:.1%}  at epoch {best_epoch}")
 
 
 def _print_analysis(event: dict):
