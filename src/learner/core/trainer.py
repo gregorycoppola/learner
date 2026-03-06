@@ -21,11 +21,11 @@ def make_state_index(machine_name: str) -> dict[str, int]:
     return {s: i for i, s in enumerate(sorted(tm.states))}
 
 
-def _build_and_train(
-    machine_name, n_samples, n_epochs, batch_size,
+def _build_data_and_model(
+    machine_name, n_samples, batch_size,
     lr, d_model, n_layers, n_heads, min_tape_len, seed
 ):
-    """Shared setup used by both streaming and non-streaming entry points."""
+    """Shared setup: data, model, optimizer, loss."""
     torch.manual_seed(seed)
 
     state_index = make_state_index(machine_name)
@@ -49,8 +49,12 @@ def _build_and_train(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn   = nn.MSELoss()
 
-    return model, optimizer, loss_fn, train_dl, X_val, Y_val, \
-           train_pairs, val_pairs, d_input, state_index
+    return (
+        model, optimizer, loss_fn,
+        train_dl, X_val, Y_val,
+        train_pairs, val_pairs,
+        d_input, state_index,
+    )
 
 
 def train_streaming(
@@ -64,13 +68,24 @@ def train_streaming(
     n_heads: int = 2,
     min_tape_len: int = 16,
     seed: int = 42,
+    analyze_every: int = 5,
+    analyze_samples: int = 500,
 ) -> Generator[dict, None, None]:
-    """Train and yield one dict per epoch."""
-    model, optimizer, loss_fn, train_dl, X_val, Y_val, \
-        train_pairs, val_pairs, d_input, state_index = _build_and_train(
-            machine_name, n_samples, n_epochs, batch_size,
-            lr, d_model, n_layers, n_heads, min_tape_len, seed,
-        )
+    """
+    Train and yield one dict per epoch.
+    Every analyze_every epochs also yields a full error breakdown.
+    """
+    from learner.core.analysis import analyze, make_breakdown_table
+
+    (
+        model, optimizer, loss_fn,
+        train_dl, X_val, Y_val,
+        train_pairs, val_pairs,
+        d_input, state_index,
+    ) = _build_data_and_model(
+        machine_name, n_samples, batch_size,
+        lr, d_model, n_layers, n_heads, min_tape_len, seed,
+    )
 
     yield {
         "type": "init",
@@ -80,6 +95,7 @@ def train_streaming(
         "d_input": d_input,
         "n_epochs": n_epochs,
         "n_samples": n_samples,
+        "analyze_every": analyze_every,
     }
 
     for epoch in range(1, n_epochs + 1):
@@ -108,6 +124,25 @@ def train_streaming(
             "val_acc":    round(acc, 4),
         }
 
+        # Full error breakdown every analyze_every epochs
+        if epoch % analyze_every == 0:
+            results = analyze(
+                model=model,
+                state_index=state_index,
+                machine_name=machine_name,
+                n_samples=analyze_samples,
+                min_tape_len=min_tape_len,
+                seed=seed + epoch,  # fresh sample each time
+            )
+            table = make_breakdown_table(results)
+            overall = sum(1 for r in results if r.all_correct) / len(results)
+            yield {
+                "type": "analysis",
+                "epoch": epoch,
+                "overall_acc": round(overall, 4),
+                "table": table,
+            }
+
     yield {"type": "done"}
 
 
@@ -123,12 +158,16 @@ def _train_and_return(
     min_tape_len: int = 16,
     seed: int = 42,
 ):
-    """Train and return (model, state_index) for analysis."""
-    model, optimizer, loss_fn, train_dl, X_val, Y_val, \
-        train_pairs, val_pairs, d_input, state_index = _build_and_train(
-            machine_name, n_samples, n_epochs, batch_size,
-            lr, d_model, n_layers, n_heads, min_tape_len, seed,
-        )
+    """Train silently and return (model, state_index) for analysis."""
+    (
+        model, optimizer, loss_fn,
+        train_dl, X_val, Y_val,
+        train_pairs, val_pairs,
+        d_input, state_index,
+    ) = _build_data_and_model(
+        machine_name, n_samples, batch_size,
+        lr, d_model, n_layers, n_heads, min_tape_len, seed,
+    )
 
     for epoch in range(1, n_epochs + 1):
         model.train()
@@ -155,9 +194,9 @@ def _step_accuracy(
     true_val  = (target[:, :, 0] > 0.5).int()
     val_match = (pred_val == true_val).all(dim=1)
 
-    head_slot = 1 + b
-    pred_head = pred[:, :, head_slot].argmax(dim=1)
-    true_head = target[:, :, head_slot].argmax(dim=1)
+    head_slot  = 1 + b
+    pred_head  = pred[:, :, head_slot].argmax(dim=1)
+    true_head  = target[:, :, head_slot].argmax(dim=1)
     head_match = (pred_head == true_head)
 
     state_start = 1 + b + 1

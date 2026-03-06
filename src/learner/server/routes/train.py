@@ -18,14 +18,13 @@ class TrainRequest(BaseModel):
     n_heads: int = 2
     min_tape_len: int = 16
     seed: int = 42
+    analyze_every: int = 5
+    analyze_samples: int = 500
 
 
 @router.post("/run")
 async def run_training(req: TrainRequest):
-    """
-    Train a transformer to predict one TM step.
-    Streams epoch updates as SSE (text/event-stream).
-    """
+    """Train and stream epoch updates + periodic error analysis as SSE."""
     from learner.core.machines import MACHINES
 
     if req.machine not in MACHINES:
@@ -47,6 +46,8 @@ async def run_training(req: TrainRequest):
             n_heads=req.n_heads,
             min_tape_len=req.min_tape_len,
             seed=req.seed,
+            analyze_every=req.analyze_every,
+            analyze_samples=req.analyze_samples,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 
