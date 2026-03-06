@@ -1,15 +1,12 @@
 """
 GRPO training loop for TM step prediction.
-
-Streams epoch-level updates including reward stats and
-periodic error analysis.
 """
 import math
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Generator
 
-from learner.core.machines import get_machine
+from learner.core.machines import get_machine, get_hard_states
 from learner.core.data import generate_pairs
 from learner.core.encoding import batch_encode
 from learner.core.model import TMTransformerCategorical
@@ -23,21 +20,21 @@ def make_state_index(machine_name: str) -> dict[str, int]:
 
 def _balanced_pairs(machine_name: str, n_samples: int, seed: int) -> list[dict]:
     import random
-    rng  = random.Random(seed)
-    pool = generate_pairs(machine_name=machine_name,
-                          n_samples=n_samples * 4, seed=seed)
-    carry  = [p for p in pool if p["state_before"] == "carry"]
-    other  = [p for p in pool if p["state_before"] != "carry"]
-    n_each = min(n_samples // 2, len(carry))
-    rng.shuffle(carry)
-    rng.shuffle(other)
-    out = carry[:n_each] + other[:n_each]
+    rng   = random.Random(seed)
+    pool  = generate_pairs(machine_name=machine_name,
+                           n_samples=n_samples * 4, seed=seed)
+    hard  = get_hard_states(machine_name)
+    heavy = [p for p in pool if p["state_before"] in hard]
+    easy  = [p for p in pool if p["state_before"] not in hard]
+    n_each = min(n_samples // 2, len(heavy))
+    rng.shuffle(heavy)
+    rng.shuffle(easy)
+    out = heavy[:n_each] + easy[:n_each]
     rng.shuffle(out)
     return out
 
 
 def _accuracy_from_rewards(rewards: torch.Tensor) -> float:
-    """Fraction of examples where at least one candidate was correct."""
     return (rewards.max(dim=1).values > 0).float().mean().item()
 
 
@@ -45,7 +42,7 @@ def train_grpo_streaming(
     machine_name: str = "incrementer",
     n_samples: int = 2000,
     n_epochs: int = 100,
-    batch_size: int = 16,   # smaller — each example generates K candidates
+    batch_size: int = 16,
     lr: float = 1e-4,
     d_model: int = 32,
     n_layers: int = 2,
@@ -57,9 +54,6 @@ def train_grpo_streaming(
     analyze_every: int = 5,
     analyze_samples: int = 500,
 ) -> Generator[dict, None, None]:
-    """
-    GRPO training loop. Yields one dict per epoch.
-    """
     from learner.core.analysis import analyze, make_breakdown_table
 
     torch.manual_seed(seed)
@@ -86,12 +80,8 @@ def train_grpo_streaming(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_dl = DataLoader(
-        TensorDataset(
-            X_train,
-            torch.arange(len(train_pairs)),  # indices to look up raw pairs
-        ),
-        batch_size=batch_size,
-        shuffle=True,
+        TensorDataset(X_train, torch.arange(len(train_pairs))),
+        batch_size=batch_size, shuffle=True,
     )
 
     yield {
@@ -109,34 +99,28 @@ def train_grpo_streaming(
 
     for epoch in range(1, n_epochs + 1):
         model.train()
-        epoch_loss    = 0.0
-        epoch_reward  = 0.0
-        n_batches     = 0
+        epoch_loss   = 0.0
+        epoch_reward = 0.0
+        n_batches    = 0
 
         for xb, idx_b in train_dl:
-            # Raw pairs for verifier
-            batch_pairs = [train_pairs[i.item()] for i in idx_b]
+            batch_pairs  = [train_pairs[i.item()] for i in idx_b]
             tape_before  = [p["tape_before"]  for p in batch_pairs]
             head_before  = [p["head_before"]  for p in batch_pairs]
             state_before = [p["state_before"] for p in batch_pairs]
 
-            # Sample K candidates
             with torch.no_grad():
                 samples = model.sample(xb, K=K)
 
-            # Verify against TM
             rewards = verify_batch(
-                samples["tape_samples"],
-                samples["head_samples"],
+                samples["tape_samples"], samples["head_samples"],
                 samples["state_samples"],
                 tape_before, head_before, state_before,
                 state_index, tm,
             )
 
-            # Store old log probs as reference
-            old_log_probs = samples["log_probs"].detach()  # (B, K)
+            old_log_probs = samples["log_probs"].detach()
 
-            # Recompute log probs with gradient for each candidate
             B, K_actual, n = samples["tape_samples"].shape
             xb_expanded = xb.unsqueeze(1).expand(B, K_actual, n, d_input)\
                            .reshape(B * K_actual, n, d_input)
@@ -149,9 +133,7 @@ def train_grpo_streaming(
                 xb_expanded, tape_idx, head_idx, state_idx
             ).reshape(B, K_actual)
 
-            loss, stats = grpo_loss(
-                log_probs_flat, old_log_probs, rewards, config
-            )
+            loss, stats = grpo_loss(log_probs_flat, old_log_probs, rewards, config)
 
             optimizer.zero_grad()
             loss.backward()
@@ -165,13 +147,11 @@ def train_grpo_streaming(
         avg_loss   = epoch_loss   / max(n_batches, 1)
         avg_reward = epoch_reward / max(n_batches, 1)
 
-        # Val reward
         model.eval()
         with torch.no_grad():
             val_samples = model.sample(X_val, K=K)
             val_rewards = verify_batch(
-                val_samples["tape_samples"],
-                val_samples["head_samples"],
+                val_samples["tape_samples"], val_samples["head_samples"],
                 val_samples["state_samples"],
                 [p["tape_before"]  for p in val_pairs],
                 [p["head_before"]  for p in val_pairs],
@@ -181,33 +161,26 @@ def train_grpo_streaming(
         val_acc = _accuracy_from_rewards(val_rewards)
 
         yield {
-            "type":        "epoch",
-            "epoch":       epoch,
-            "train_loss":  round(avg_loss, 6),
+            "type":         "epoch",
+            "epoch":        epoch,
+            "train_loss":   round(avg_loss,   6),
             "train_reward": round(avg_reward, 4),
-            "val_acc":     round(val_acc, 4),
+            "val_acc":      round(val_acc,    4),
         }
 
-        # Periodic analysis
         if epoch % analyze_every == 0:
             results = analyze(
-                model=model,
-                state_index=state_index,
-                machine_name=machine_name,
-                n_samples=analyze_samples,
-                min_tape_len=min_tape_len,
-                seed=seed + epoch,
+                model=model, state_index=state_index,
+                machine_name=machine_name, n_samples=analyze_samples,
+                min_tape_len=min_tape_len, seed=seed + epoch,
                 mode="categorical",
             )
             table   = make_breakdown_table(results)
             overall = sum(1 for r in results if r.all_correct) / len(results)
-
             category_summary = {
                 row["value"]: row["acc"]
-                for row in table
-                if row["feature"] == "state_before"
+                for row in table if row["feature"] == "state_before"
             }
-
             yield {
                 "type":             "analysis",
                 "epoch":            epoch,
