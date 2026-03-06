@@ -12,10 +12,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from learner.server.routes import health, tm
+from learner.server.routes import health, tm, train
 
 app.include_router(health.router)
 app.include_router(tm.router)
+app.include_router(train.router)
 
 
 @app.on_event("startup")
