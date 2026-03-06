@@ -1,91 +1,62 @@
 """
-Hybrid loss trainer: cross-entropy for scan_right, verifiable binary
-penalty for carry.
+Hybrid loss trainer: weighted cross-entropy on carry examples.
 
 For each batch:
   - scan_right examples: standard cross-entropy on all three heads
-  - carry examples: run tm.step() on the greedy prediction, penalize
-    hard if wrong (weighted by carry_weight)
+  - carry examples:      same cross-entropy, multiplied by carry_weight
 
-No sampling, no K candidates. Single forward pass, deterministic.
-The carry loss is: carry_weight * (1 - correct) per example.
+Both losses are fully differentiable. Gradients flow through logits
+for all examples. The carry_weight forces the model to treat carry
+errors as proportionally more costly than scan_right errors.
+
+Optional per-head weights (tape_weight, head_weight, state_weight)
+address the imbalance between the tape head (n terms) vs head/state
+(1 term each) in the CE sum.
 """
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Generator
 
 from learner.core.machines import get_machine
-from learner.core.data import generate_pairs
 from learner.core.encoding import batch_encode
 from learner.core.model import TMTransformerCategorical
 from learner.core.trainer_sft_grpo import (
-    _categorical_sft_loss, _sft_accuracy, make_state_index, _balanced_pairs
+    _sft_accuracy, make_state_index, _balanced_pairs
 )
 
 
-def _greedy_decode(logits: dict, state_index: dict) -> tuple:
-    """
-    Greedy decode logits to (tape_syms, head_pos, state_str).
-    Returns lists/ints for a single example (logits are unbatched).
-    """
-    from learner.core.model import TMTransformerCategorical as Cat
-    idx2sym   = {v: k for k, v in Cat.SYM2IDX.items()}
-    idx2state = {v: k for k, v in state_index.items()}
-
-    tape  = [idx2sym[i.item()] for i in logits["value_logits"].argmax(dim=-1)]
-    head  = logits["head_logits"].argmax(dim=-1).item()
-    state = idx2state.get(logits["state_logits"].argmax(dim=-1).item(), "unknown")
-    return tape, head, state
-
-
-def _verify_carry_batch(
+def _weighted_ce_loss(
     logits: dict,
-    batch_pairs: list[dict],
-    carry_mask: torch.Tensor,
+    yb: torch.Tensor,
     state_index: dict,
-    tm,
+    tape_weight: float = 1.0,
+    head_weight: float = 1.0,
+    state_weight: float = 1.0,
 ) -> torch.Tensor:
     """
-    For carry examples, run tm.step() on greedy prediction.
-    Returns per-example binary correct tensor (B,) float.
-    Only meaningful where carry_mask is True.
+    Cross-entropy loss on all three heads with optional per-head weights.
     """
-    from learner.core.model import TMTransformerCategorical as Cat
-    idx2sym   = {v: k for k, v in Cat.SYM2IDX.items()}
-    idx2state = {v: k for k, v in state_index.items()}
+    B, n, d = yb.shape
+    b = max(1, math.ceil(math.log2(n + 1)))
+    S = len(state_index)
 
-    B = logits["value_logits"].shape[0]
-    correct = torch.zeros(B)
+    val_targets   = (yb[:, :, 0] > 0.5).long()
+    head_slot     = 1 + b
+    head_targets  = yb[:, :, head_slot].argmax(dim=1)
+    state_start   = 1 + b + 1
+    state_targets = yb[:, :, state_start:state_start + S].mean(dim=1).argmax(dim=1)
 
-    tape_preds  = logits["value_logits"].argmax(dim=-1)   # (B, n)
-    head_preds  = logits["head_logits"].argmax(dim=-1)    # (B,)
-    state_preds = logits["state_logits"].argmax(dim=-1)   # (B,)
+    vl = logits["value_logits"]   # (B, n, 3)
+    hl = logits["head_logits"]    # (B, n)
+    sl = logits["state_logits"]   # (B, S)
 
-    for b in range(B):
-        if not carry_mask[b]:
-            continue
+    loss_tape  = F.cross_entropy(vl.reshape(B * n, 3), val_targets.reshape(B * n))
+    loss_head  = F.cross_entropy(hl, head_targets)
+    loss_state = F.cross_entropy(sl, state_targets)
 
-        pair = batch_pairs[b]
-        true_tape, true_head, true_state, _ = tm.step(
-            pair["tape_before"], pair["head_before"], pair["state_before"]
-        )
-
-        pred_tape  = [idx2sym[tape_preds[b, i].item()]
-                      for i in range(tape_preds.shape[1])]
-        pred_head  = head_preds[b].item()
-        pred_state = idx2state.get(state_preds[b].item(), "unknown")
-
-        tape_ok  = pred_tape[:len(true_tape)] == true_tape
-        head_ok  = pred_head == true_head
-        state_ok = pred_state == true_state
-
-        if tape_ok and head_ok and state_ok:
-            correct[b] = 1.0
-
-    return correct
+    return tape_weight * loss_tape + head_weight * loss_head + state_weight * loss_state
 
 
 def hybrid_loss(
@@ -93,19 +64,16 @@ def hybrid_loss(
     yb: torch.Tensor,
     batch_pairs: list[dict],
     state_index: dict,
-    tm,
     carry_weight: float = 10.0,
+    tape_weight: float = 1.0,
+    head_weight: float = 1.0,
+    state_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Combined loss:
-      scan_right: cross-entropy (standard)
-      carry:      carry_weight * (1 - correct)  (verifiable binary)
-
-    Returns (loss, stats_dict).
+    Combined differentiable loss:
+      scan_right: CE (standard weight)
+      carry:      CE * carry_weight
     """
-    B = yb.shape[0]
-
-    # Identify carry examples
     carry_mask = torch.tensor([
         p["state_before"] == "carry" for p in batch_pairs
     ])
@@ -114,31 +82,31 @@ def hybrid_loss(
     n_carry = carry_mask.sum().item()
     n_scan  = scan_mask.sum().item()
 
-    # ── Cross-entropy loss on scan_right examples ──
+    kwargs = dict(
+        state_index=state_index,
+        tape_weight=tape_weight,
+        head_weight=head_weight,
+        state_weight=state_weight,
+    )
+
     if n_scan > 0:
-        loss_scan = _categorical_sft_loss(
+        loss_scan = _weighted_ce_loss(
             {k: v[scan_mask] for k, v in logits.items()},
             yb[scan_mask],
-            state_index,
+            **kwargs,
         )
     else:
         loss_scan = torch.tensor(0.0)
 
-    # ── Verifiable binary loss on carry examples ──
     if n_carry > 0:
-        correct = _verify_carry_batch(
-            {k: v for k, v in logits.items()},
-            batch_pairs, carry_mask, state_index, tm,
+        loss_carry = carry_weight * _weighted_ce_loss(
+            {k: v[carry_mask] for k, v in logits.items()},
+            yb[carry_mask],
+            **kwargs,
         )
-        # Loss is high when wrong, zero when correct
-        carry_losses = carry_weight * (1.0 - correct[carry_mask])
-        loss_carry   = carry_losses.mean()
-        carry_acc    = correct[carry_mask].mean().item()
     else:
         loss_carry = torch.tensor(0.0)
-        carry_acc  = 0.0
 
-    # Weighted combination
     if n_carry > 0 and n_scan > 0:
         total = loss_scan + loss_carry
     elif n_carry > 0:
@@ -149,7 +117,6 @@ def hybrid_loss(
     stats = {
         "loss_scan":  round(loss_scan.item(), 6),
         "loss_carry": round(loss_carry.item(), 6),
-        "carry_acc":  round(carry_acc, 4),
         "n_carry":    int(n_carry),
         "n_scan":     int(n_scan),
     }
@@ -169,17 +136,19 @@ def train_hybrid_streaming(
     min_tape_len: int = 16,
     seed: int = 42,
     carry_weight: float = 10.0,
+    tape_weight: float = 1.0,
+    head_weight: float = 1.0,
+    state_weight: float = 1.0,
     analyze_every: int = 5,
     analyze_samples: int = 500,
 ) -> Generator[dict, None, None]:
     """
-    Hybrid loss training. Yields one dict per epoch + periodic analysis.
+    Hybrid weighted CE training. Yields one dict per epoch + periodic analysis.
     """
     from learner.core.analysis import analyze, make_breakdown_table
 
     torch.manual_seed(seed)
     state_index = make_state_index(machine_name)
-    tm          = get_machine(machine_name)
 
     pairs = _balanced_pairs(machine_name, n_samples, seed)
     split = int(0.9 * len(pairs))
@@ -199,7 +168,6 @@ def train_hybrid_streaming(
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Keep indices so we can look up raw pairs per batch
     train_dl = DataLoader(
         TensorDataset(X_train, Y_train, torch.arange(len(train_pairs))),
         batch_size=batch_size, shuffle=True,
@@ -210,21 +178,20 @@ def train_hybrid_streaming(
         "machine":       machine_name,
         "n_train":       len(train_pairs),
         "n_val":         len(val_pairs),
-        "d_input":       d_input,
-        "n_epochs":      n_epochs,
         "carry_weight":  carry_weight,
+        "tape_weight":   tape_weight,
+        "head_weight":   head_weight,
+        "state_weight":  state_weight,
         "analyze_every": analyze_every,
     }
 
-    best_val_acc  = 0.0
-    best_carry_acc = 0.0
+    best_val_acc = 0.0
 
     for epoch in range(1, n_epochs + 1):
         model.train()
-        epoch_loss      = 0.0
-        epoch_carry_acc = 0.0
-        epoch_carry_n   = 0
-        n_batches       = 0
+        epoch_loss   = 0.0
+        epoch_lscan  = 0.0
+        epoch_lcarry = 0.0
 
         for xb, yb, idx_b in train_dl:
             batch_pairs = [train_pairs[i.item()] for i in idx_b]
@@ -232,33 +199,35 @@ def train_hybrid_streaming(
             optimizer.zero_grad()
             logits = model(xb)
             loss, stats = hybrid_loss(
-                logits, yb, batch_pairs, state_index, tm,
+                logits, yb, batch_pairs, state_index,
                 carry_weight=carry_weight,
+                tape_weight=tape_weight,
+                head_weight=head_weight,
+                state_weight=state_weight,
             )
             loss.backward()
             optimizer.step()
 
-            epoch_loss      += loss.item() * len(xb)
-            epoch_carry_acc += stats["carry_acc"] * stats["n_carry"]
-            epoch_carry_n   += stats["n_carry"]
-            n_batches       += 1
+            epoch_loss   += loss.item() * len(xb)
+            epoch_lscan  += stats["loss_scan"]  * stats["n_scan"]
+            epoch_lcarry += stats["loss_carry"] * stats["n_carry"]
 
-        epoch_loss      /= len(train_pairs)
-        epoch_carry_acc  = epoch_carry_acc / max(epoch_carry_n, 1)
+        n = len(train_pairs)
+        epoch_loss   /= n
+        epoch_lscan  /= n
+        epoch_lcarry /= n
 
         val_acc = _sft_accuracy(model, X_val, Y_val, state_index)
-
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-        if epoch_carry_acc > best_carry_acc:
-            best_carry_acc = epoch_carry_acc
 
         yield {
-            "type":            "epoch",
-            "epoch":           epoch,
-            "train_loss":      round(epoch_loss, 6),
-            "train_carry_acc": round(epoch_carry_acc, 4),
-            "val_acc":         round(val_acc, 4),
+            "type":       "epoch",
+            "epoch":      epoch,
+            "train_loss": round(epoch_loss, 6),
+            "loss_scan":  round(epoch_lscan, 6),
+            "loss_carry": round(epoch_lcarry, 6),
+            "val_acc":    round(val_acc, 4),
         }
 
         if epoch % analyze_every == 0:
