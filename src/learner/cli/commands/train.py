@@ -8,18 +8,18 @@ def add_subparser(subparsers):
     sub = p.add_subparsers(dest="train_command", required=True)
 
     run_p = sub.add_parser("run", help="Train on a TM and stream loss curve")
-    run_p.add_argument("--machine",         default="incrementer")
-    run_p.add_argument("--samples",         type=int, default=2000)
-    run_p.add_argument("--epochs",          type=int, default=100)
-    run_p.add_argument("--batch-size",      type=int, default=32)
-    run_p.add_argument("--lr",              type=float, default=1e-3)
-    run_p.add_argument("--d-model",         type=int, default=32)
-    run_p.add_argument("--layers",          type=int, default=2)
-    run_p.add_argument("--analyze-every",   type=int, default=5,
-                       help="Print error breakdown every N epochs")
-    run_p.add_argument("--analyze-samples", type=int, default=500,
-                       help="Samples to use for each analysis")
-    run_p.add_argument("--url",             default="http://localhost:8000")
+    run_p.add_argument("--machine",           default="incrementer")
+    run_p.add_argument("--samples",           type=int,   default=2000)
+    run_p.add_argument("--epochs",            type=int,   default=100)
+    run_p.add_argument("--batch-size",        type=int,   default=32)
+    run_p.add_argument("--lr",                type=float, default=1e-3)
+    run_p.add_argument("--d-model",           type=int,   default=32)
+    run_p.add_argument("--layers",            type=int,   default=2)
+    run_p.add_argument("--analyze-every",     type=int,   default=5)
+    run_p.add_argument("--analyze-samples",   type=int,   default=500)
+    run_p.add_argument("--hard-multiplier",   type=float, default=4.0)
+    run_p.add_argument("--easy-multiplier",   type=float, default=0.5)
+    run_p.add_argument("--url",               default="http://localhost:8000")
     run_p.set_defaults(func=cmd_run)
 
 
@@ -34,9 +34,11 @@ def cmd_run(args):
         "n_layers":         args.layers,
         "analyze_every":    args.analyze_every,
         "analyze_samples":  args.analyze_samples,
+        "hard_multiplier":  args.hard_multiplier,
+        "easy_multiplier":  args.easy_multiplier,
     }
 
-    best_acc = 0.0
+    best_acc   = 0.0
     best_epoch = 0
 
     with get_client(args.url) as client:
@@ -56,9 +58,9 @@ def cmd_run(args):
                     print(f"Epochs         : {event['n_epochs']}")
                     print(f"Analyze every  : {event['analyze_every']} epochs")
                     print()
-                    print(f"{'Epoch':<8} {'Train Loss':<14} {'Val Loss':<14} "
-                          f"{'Val Acc':<10} {'Best'}")
-                    print("-" * 56)
+                    print(f"{'Ep':<6} {'T-Loss':<12} {'V-Loss':<12} "
+                          f"{'V-Acc':<8} {'W-min':<8} {'W-max':<8} {'Best'}")
+                    print("-" * 62)
 
                 elif event["type"] == "epoch":
                     ep  = event["epoch"]
@@ -70,10 +72,12 @@ def cmd_run(args):
                     else:
                         marker = ""
                     print(
-                        f"{ep:<8} "
-                        f"{event['train_loss']:<14.6f} "
-                        f"{event['val_loss']:<14.6f} "
-                        f"{acc:<10.4f} "
+                        f"{ep:<6} "
+                        f"{event['train_loss']:<12.6f} "
+                        f"{event['val_loss']:<12.6f} "
+                        f"{acc:<8.4f} "
+                        f"{event['w_min']:<8.3f} "
+                        f"{event['w_max']:<8.3f} "
                         f"{marker}",
                         flush=True,
                     )
@@ -83,19 +87,33 @@ def cmd_run(args):
 
                 elif event["type"] == "done":
                     print()
-                    print(f"Done.  Best val accuracy: {best_acc:.1%} at epoch {best_epoch}")
+                    print(f"Done.  Best val accuracy: {best_acc:.1%} "
+                          f"at epoch {best_epoch}")
 
 
 def _print_analysis(event: dict):
-    epoch = event["epoch"]
-    overall = event["overall_acc"]
-    table = event["table"]
+    epoch    = event["epoch"]
+    overall  = event["overall_acc"]
+    mastered = event["n_mastered"]
+    total    = event["n_total"]
+    w_min    = event["weight_min"]
+    w_max    = event["weight_max"]
+    table    = event["table"]
+    cats     = event.get("category_summary", {})
 
     print()
-    print(f"  ── Analysis at epoch {epoch}  (overall {overall:.1%}) ──")
-    print(f"  {'Feature':<22} {'Value':<16} {'N':>6}  "
+    print(f"  ── Epoch {epoch}  overall {overall:.1%}  "
+          f"mastered {mastered}/{total}  "
+          f"weights [{w_min:.2f}–{w_max:.2f}] ──")
+
+    # One-line category summary
+    cat_str = "  ".join(f"{k}:{v:.1%}" for k, v in sorted(cats.items()))
+    if cat_str:
+        print(f"  States: {cat_str}")
+
+    print(f"  {'Feature':<22} {'Value':<16} {'N':>5}  "
           f"{'Acc':>7}  {'Tape':>7}  {'Head':>7}  {'State':>7}")
-    print("  " + "-" * 74)
+    print("  " + "-" * 72)
 
     current_feature = None
     for row in table:
@@ -105,16 +123,14 @@ def _print_analysis(event: dict):
                 print()
             current_feature = feat
 
-        n   = row["n"]
-        acc = row["acc"]
-        ta  = row["tape_acc"]
-        ha  = row["head_acc"]
-        sa  = row["state_acc"]
-        marker = "  ◀" if acc < 0.85 and n > 10 else ""
+        n      = row["n"]
+        acc    = row["acc"]
+        marker = "  ◀" if acc < 0.90 and n > 10 else ""
 
         print(
-            f"  {feat:<22} {str(row['value']):<16} {n:>6}  "
-            f"{acc:>6.1%}  {ta:>6.1%}  {ha:>6.1%}  {sa:>6.1%}"
+            f"  {feat:<22} {str(row['value']):<16} {n:>5}  "
+            f"{acc:>6.1%}  {row['tape_acc']:>6.1%}  "
+            f"{row['head_acc']:>6.1%}  {row['state_acc']:>6.1%}"
             f"{marker}",
             flush=True,
         )

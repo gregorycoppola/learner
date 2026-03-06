@@ -20,11 +20,14 @@ class TrainRequest(BaseModel):
     seed: int = 42
     analyze_every: int = 5
     analyze_samples: int = 500
+    hard_multiplier: float = 4.0
+    easy_multiplier: float = 0.5
+    mastered_threshold: float = 0.95
 
 
 @router.post("/run")
 async def run_training(req: TrainRequest):
-    """Train and stream epoch updates + periodic error analysis as SSE."""
+    """Train with dynamic curriculum, stream epoch + analysis events."""
     from learner.core.machines import MACHINES
 
     if req.machine not in MACHINES:
@@ -48,6 +51,9 @@ async def run_training(req: TrainRequest):
             seed=req.seed,
             analyze_every=req.analyze_every,
             analyze_samples=req.analyze_samples,
+            hard_multiplier=req.hard_multiplier,
+            easy_multiplier=req.easy_multiplier,
+            mastered_threshold=req.mastered_threshold,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 
