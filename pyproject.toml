@@ -1,0 +1,28 @@
+[project]
+name = "learner"
+version = "0.1.0"
+description = "Transformer agent Turing machine learner"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "httpx>=0.28.1",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "torch>=2.2.0,<2.10.0",
+]
+
+[project.scripts]
+learner = "learner.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/learner"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
