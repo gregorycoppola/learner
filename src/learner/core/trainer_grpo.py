@@ -20,12 +20,19 @@ def make_state_index(machine_name: str) -> dict[str, int]:
 
 def _balanced_pairs(machine_name: str, n_samples: int, seed: int) -> list[dict]:
     import random
-    rng   = random.Random(seed)
-    pool  = generate_pairs(machine_name=machine_name,
-                           n_samples=n_samples * 4, seed=seed)
-    hard  = get_hard_states(machine_name)
-    heavy = [p for p in pool if p["state_before"] in hard]
-    easy  = [p for p in pool if p["state_before"] not in hard]
+    rng  = random.Random(seed)
+    hard = get_hard_states(machine_name)
+
+    pool = generate_pairs(machine_name=machine_name,
+                          n_samples=n_samples * 4, seed=seed)
+
+    # If no hard states defined, just shuffle and return n_samples
+    if not hard:
+        rng.shuffle(pool)
+        return pool[:n_samples]
+
+    heavy  = [p for p in pool if p["state_before"] in hard]
+    easy   = [p for p in pool if p["state_before"] not in hard]
     n_each = min(n_samples // 2, len(heavy))
     rng.shuffle(heavy)
     rng.shuffle(easy)
