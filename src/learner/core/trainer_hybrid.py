@@ -7,6 +7,8 @@ borrow) that are minority classes in the natural distribution.
 
 Uses the 3-class value encoding from encoding.py so that blank
 cells are distinguishable from zero cells in both input and target.
+
+Stops early when val_acc reaches 1.0.
 """
 import math
 import torch
@@ -169,7 +171,7 @@ def train_hybrid_streaming(
             loss.backward()
             optimizer.step()
 
-            epoch_loss  += loss.item()  * len(xb)
+            epoch_loss  += loss.item()        * len(xb)
             epoch_leasy += stats["loss_easy"] * stats["n_easy"]
             epoch_lhard += stats["loss_hard"] * stats["n_hard"]
 
@@ -190,6 +192,30 @@ def train_hybrid_streaming(
             "loss_hard":  round(epoch_lhard, 6),
             "val_acc":    round(val_acc, 4),
         }
+
+        # Early stopping on perfect accuracy
+        if val_acc >= 1.0:
+            results = analyze(
+                model=model, state_index=state_index,
+                machine_name=machine_name, n_samples=analyze_samples,
+                min_tape_len=min_tape_len, seed=seed + epoch,
+                mode="categorical",
+            )
+            table   = make_breakdown_table(results)
+            overall = sum(1 for r in results if r.all_correct) / len(results)
+            cats    = {
+                row["value"]: row["acc"]
+                for row in table if row["feature"] == "state_before"
+            }
+            yield {
+                "type":             "analysis",
+                "epoch":            epoch,
+                "overall_acc":      round(overall, 4),
+                "category_summary": cats,
+                "table":            table,
+            }
+            yield {"type": "done", "best_val_acc": 1.0, "stopped_early": True, "epoch": epoch}
+            return
 
         if epoch % analyze_every == 0:
             results = analyze(
@@ -212,4 +238,4 @@ def train_hybrid_streaming(
                 "table":            table,
             }
 
-    yield {"type": "done", "best_val_acc": round(best_val_acc, 4)}
+    yield {"type": "done", "best_val_acc": round(best_val_acc, 4), "stopped_early": False}
