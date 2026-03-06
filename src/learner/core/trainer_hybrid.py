@@ -1,17 +1,11 @@
 """
 Hybrid loss trainer: weighted cross-entropy on carry examples.
 
-For each batch:
-  - scan_right examples: standard cross-entropy on all three heads
-  - carry examples:      same cross-entropy, multiplied by carry_weight
+Both losses are fully differentiable. The carry_weight multiplier
+forces the model to prioritize carry correctness.
 
-Both losses are fully differentiable. Gradients flow through logits
-for all examples. The carry_weight forces the model to treat carry
-errors as proportionally more costly than scan_right errors.
-
-Optional per-head weights (tape_weight, head_weight, state_weight)
-address the imbalance between the tape head (n terms) vs head/state
-(1 term each) in the CE sum.
+Uses the 3-class value encoding from encoding.py so that blank
+cells are distinguishable from zero cells in both input and target.
 """
 import math
 import torch
@@ -19,11 +13,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Generator
 
-from learner.core.machines import get_machine
 from learner.core.encoding import batch_encode
 from learner.core.model import TMTransformerCategorical
 from learner.core.trainer_sft_grpo import (
-    _sft_accuracy, make_state_index, _balanced_pairs
+    _sft_accuracy, _extract_targets, make_state_index, _balanced_pairs
 )
 
 
@@ -35,18 +28,8 @@ def _weighted_ce_loss(
     head_weight: float = 1.0,
     state_weight: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Cross-entropy loss on all three heads with optional per-head weights.
-    """
     B, n, d = yb.shape
-    b = max(1, math.ceil(math.log2(n + 1)))
-    S = len(state_index)
-
-    val_targets   = (yb[:, :, 0] > 0.5).long()
-    head_slot     = 1 + b
-    head_targets  = yb[:, :, head_slot].argmax(dim=1)
-    state_start   = 1 + b + 1
-    state_targets = yb[:, :, state_start:state_start + S].mean(dim=1).argmax(dim=1)
+    val_targets, head_targets, state_targets = _extract_targets(yb, state_index)
 
     vl = logits["value_logits"]   # (B, n, 3)
     hl = logits["head_logits"]    # (B, n)
@@ -69,18 +52,10 @@ def hybrid_loss(
     head_weight: float = 1.0,
     state_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
-    """
-    Combined differentiable loss:
-      scan_right: CE (standard weight)
-      carry:      CE * carry_weight
-    """
-    carry_mask = torch.tensor([
-        p["state_before"] == "carry" for p in batch_pairs
-    ])
-    scan_mask = ~carry_mask
-
-    n_carry = carry_mask.sum().item()
-    n_scan  = scan_mask.sum().item()
+    carry_mask = torch.tensor([p["state_before"] == "carry" for p in batch_pairs])
+    scan_mask  = ~carry_mask
+    n_carry    = carry_mask.sum().item()
+    n_scan     = scan_mask.sum().item()
 
     kwargs = dict(
         state_index=state_index,
@@ -89,39 +64,22 @@ def hybrid_loss(
         state_weight=state_weight,
     )
 
-    if n_scan > 0:
-        loss_scan = _weighted_ce_loss(
-            {k: v[scan_mask] for k, v in logits.items()},
-            yb[scan_mask],
-            **kwargs,
-        )
-    else:
-        loss_scan = torch.tensor(0.0)
+    loss_scan  = _weighted_ce_loss(
+        {k: v[scan_mask] for k, v in logits.items()}, yb[scan_mask], **kwargs
+    ) if n_scan > 0 else torch.tensor(0.0)
 
-    if n_carry > 0:
-        loss_carry = carry_weight * _weighted_ce_loss(
-            {k: v[carry_mask] for k, v in logits.items()},
-            yb[carry_mask],
-            **kwargs,
-        )
-    else:
-        loss_carry = torch.tensor(0.0)
+    loss_carry = carry_weight * _weighted_ce_loss(
+        {k: v[carry_mask] for k, v in logits.items()}, yb[carry_mask], **kwargs
+    ) if n_carry > 0 else torch.tensor(0.0)
 
-    if n_carry > 0 and n_scan > 0:
-        total = loss_scan + loss_carry
-    elif n_carry > 0:
-        total = loss_carry
-    else:
-        total = loss_scan
+    total = loss_scan + loss_carry
 
-    stats = {
-        "loss_scan":  round(loss_scan.item(), 6),
+    return total, {
+        "loss_scan":  round(loss_scan.item(),  6),
         "loss_carry": round(loss_carry.item(), 6),
         "n_carry":    int(n_carry),
         "n_scan":     int(n_scan),
     }
-
-    return total, stats
 
 
 def train_hybrid_streaming(
@@ -142,9 +100,6 @@ def train_hybrid_streaming(
     analyze_every: int = 5,
     analyze_samples: int = 500,
 ) -> Generator[dict, None, None]:
-    """
-    Hybrid weighted CE training. Yields one dict per epoch + periodic analysis.
-    """
     from learner.core.analysis import analyze, make_breakdown_table
 
     torch.manual_seed(seed)

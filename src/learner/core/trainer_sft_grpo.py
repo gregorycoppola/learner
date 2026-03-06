@@ -1,7 +1,7 @@
 """
 Two-phase SFT -> GRPO training pipeline.
 
-Phase 1 (SFT): supervised MSE on the categorical model until
+Phase 1 (SFT): supervised cross-entropy on the categorical model until
 scan_right accuracy hits sft_threshold. Saves checkpoint.
 
 Phase 2 (GRPO): loads SFT checkpoint, switches to GRPO with
@@ -13,7 +13,6 @@ Streams events throughout both phases.
 """
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Generator
@@ -29,30 +28,37 @@ from learner.core.trainer_grpo import (
 )
 
 
-# ── SFT helpers ──────────────────────────────────────────────────────────────
-
-def _categorical_sft_loss(logits: dict, Y: torch.Tensor, state_index: dict) -> torch.Tensor:
+def _extract_targets(Y: torch.Tensor, state_index: dict):
     """
-    Cross-entropy loss on each categorical head separately.
+    Extract (val_targets, head_targets, state_targets) from encoded Y.
 
-    Y is the encoded target tensor (B, n, d) from batch_encode.
-    We extract ground-truth indices for value, head, and state slots.
+    Slot layout (new 3-class encoding):
+      [val_oh(3), pos(b), is_head(1), state_oh(S)]
+      d = 3 + b + 1 + S
+
+    val_targets:   (B, n)  class in {0='0', 1='1', 2='_'}
+    head_targets:  (B,)    position index
+    state_targets: (B,)    state index
     """
     B, n, d = Y.shape
-    b       = max(1, math.ceil(math.log2(n + 1)))
-    S       = len(state_index)
+    b = max(1, math.ceil(math.log2(n + 1)))
+    S = len(state_index)
 
-    # Value targets: slot 0, threshold at 0.5 → class 0 (sym "0") or 1 (sym "1")
-    # Blank (_) never appears as a target value in our training pairs
-    val_targets = (Y[:, :, 0] > 0.5).long()  # (B, n)  values in {0,1}
+    val_targets   = Y[:, :, 0:3].argmax(dim=-1)                              # (B, n)
 
-    # Head targets: argmax of slot (1+b)
-    head_slot    = 1 + b
-    head_targets = Y[:, :, head_slot].argmax(dim=1)  # (B,)
+    head_slot     = 3 + b
+    head_targets  = Y[:, :, head_slot].argmax(dim=1)                          # (B,)
 
-    # State targets: argmax of mean over state slots
-    state_start   = 1 + b + 1
+    state_start   = 3 + b + 1
     state_targets = Y[:, :, state_start:state_start + S].mean(dim=1).argmax(dim=1)  # (B,)
+
+    return val_targets, head_targets, state_targets
+
+
+def _categorical_sft_loss(logits: dict, Y: torch.Tensor, state_index: dict) -> torch.Tensor:
+    """Cross-entropy loss on each categorical head."""
+    B, n, d = Y.shape
+    val_targets, head_targets, state_targets = _extract_targets(Y, state_index)
 
     vl = logits["value_logits"]   # (B, n, 3)
     hl = logits["head_logits"]    # (B, n)
@@ -67,14 +73,6 @@ def _categorical_sft_loss(logits: dict, Y: torch.Tensor, state_index: dict) -> t
 
 def _sft_accuracy(model, X_val, Y_val, state_index):
     """Overall step accuracy on val set using greedy decode."""
-    from learner.core.model import TMTransformerCategorical as Cat
-    from learner.core.encoding import decode_snapshot
-
-    b       = max(1, math.ceil(math.log2(X_val.shape[1] + 1)))
-    S       = len(state_index)
-    idx2sym = {v: k for k, v in Cat.SYM2IDX.items()}
-    idx2st  = {v: k for k, v in state_index.items()}
-
     model.eval()
     with torch.no_grad():
         logits = model(X_val)
@@ -83,12 +81,7 @@ def _sft_accuracy(model, X_val, Y_val, state_index):
     head_idx  = logits["head_logits"].argmax(dim=-1)    # (B,)
     state_idx = logits["state_logits"].argmax(dim=-1)   # (B,)
 
-    # Ground truth from Y_val
-    head_slot    = 1 + b
-    state_start  = 1 + b + 1
-    true_head    = Y_val[:, :, head_slot].argmax(dim=1)
-    true_state   = Y_val[:, :, state_start:state_start + S].mean(dim=1).argmax(dim=1)
-    true_val     = (Y_val[:, :, 0] > 0.5).long()
+    true_val, true_head, true_state = _extract_targets(Y_val, state_index)
 
     val_match   = (tape_idx == true_val).all(dim=1)
     head_match  = (head_idx == true_head)
@@ -102,18 +95,15 @@ def _sft_accuracy(model, X_val, Y_val, state_index):
 def train_sft_then_grpo_streaming(
     machine_name: str = "incrementer",
     n_samples: int = 2000,
-    # SFT params
     sft_max_epochs: int = 50,
     sft_threshold: float = 0.90,
     sft_lr: float = 1e-3,
     sft_batch_size: int = 32,
-    # GRPO params
     grpo_epochs: int = 100000,
     grpo_lr: float = 1e-4,
     grpo_batch_size: int = 16,
     K: int = 8,
     kl_coef: float = 0.01,
-    # Shared
     d_model: int = 32,
     n_layers: int = 2,
     n_heads: int = 2,
@@ -123,11 +113,6 @@ def train_sft_then_grpo_streaming(
     analyze_samples: int = 500,
     checkpoint_name: str = None,
 ) -> Generator[dict, None, None]:
-    """
-    Phase 1: SFT until sft_threshold, save checkpoint.
-    Phase 2: GRPO from SFT init.
-    Yields events throughout.
-    """
     from learner.core.analysis import analyze, make_breakdown_table
 
     torch.manual_seed(seed)
@@ -157,18 +142,18 @@ def train_sft_then_grpo_streaming(
     )
 
     yield {
-        "type":          "init",
-        "machine":       machine_name,
-        "n_train":       len(train_pairs),
-        "n_val":         len(val_pairs),
-        "d_input":       d_input,
-        "n_tape":        n_tape,
-        "n_states":      n_states,
+        "type":           "init",
+        "machine":        machine_name,
+        "n_train":        len(train_pairs),
+        "n_val":          len(val_pairs),
+        "d_input":        d_input,
+        "n_tape":         n_tape,
+        "n_states":       n_states,
         "sft_max_epochs": sft_max_epochs,
-        "sft_threshold": sft_threshold,
-        "grpo_epochs":   grpo_epochs,
-        "K":             K,
-        "analyze_every": analyze_every,
+        "sft_threshold":  sft_threshold,
+        "grpo_epochs":    grpo_epochs,
+        "K":              K,
+        "analyze_every":  analyze_every,
     }
 
     # ── Phase 1: SFT ──────────────────────────────────────────────────────────
@@ -180,7 +165,7 @@ def train_sft_then_grpo_streaming(
         batch_size=sft_batch_size, shuffle=True,
     )
 
-    sft_epoch   = 0
+    sft_epoch    = 0
     best_sft_acc = 0.0
 
     for epoch in range(1, sft_max_epochs + 1):
@@ -210,7 +195,6 @@ def train_sft_then_grpo_streaming(
             "val_acc":    round(val_acc, 4),
         }
 
-        # Periodic analysis during SFT
         if epoch % analyze_every == 0:
             results = analyze(
                 model=model, state_index=state_index,
@@ -249,7 +233,6 @@ def train_sft_then_grpo_streaming(
             "reason":  f"reached max epochs {sft_max_epochs}",
         }
 
-    # Save SFT checkpoint
     ckpt_name = checkpoint_name or f"{machine_name}_sft_e{sft_epoch}"
     ckpt_path = save_checkpoint(
         model=model, model_class="categorical",
@@ -258,11 +241,7 @@ def train_sft_then_grpo_streaming(
         val_acc=best_sft_acc, phase="sft",
         name=ckpt_name,
     )
-    yield {
-        "type": "checkpoint_saved",
-        "path": str(ckpt_path),
-        "name": ckpt_name,
-    }
+    yield {"type": "checkpoint_saved", "path": str(ckpt_path), "name": ckpt_name}
 
     # ── Phase 2: GRPO ─────────────────────────────────────────────────────────
     yield {"type": "phase", "phase": "grpo"}
@@ -312,9 +291,7 @@ def train_sft_then_grpo_streaming(
                 xb_exp, tape_idx, head_idx, state_idx,
             ).reshape(B, K_actual)
 
-            loss, stats = grpo_loss(
-                log_probs_flat, old_log_probs, rewards, config,
-            )
+            loss, stats = grpo_loss(log_probs_flat, old_log_probs, rewards, config)
 
             optimizer.zero_grad()
             loss.backward()
@@ -327,9 +304,7 @@ def train_sft_then_grpo_streaming(
 
         avg_loss   = epoch_loss   / max(n_batches, 1)
         avg_reward = epoch_reward / max(n_batches, 1)
-
-        # Val accuracy via greedy decode
-        val_acc = _sft_accuracy(model, X_val, Y_val, state_index)
+        val_acc    = _sft_accuracy(model, X_val, Y_val, state_index)
 
         if val_acc > best_grpo_acc:
             best_grpo_acc = val_acc
@@ -364,15 +339,5 @@ def train_sft_then_grpo_streaming(
                 "category_summary": cats,
                 "table":            table,
             }
-
-            # Save best GRPO checkpoint
-            if val_acc >= best_grpo_acc:
-                save_checkpoint(
-                    model=model, model_class="categorical",
-                    arch=arch, state_index=state_index,
-                    machine=machine_name, epoch=epoch,
-                    val_acc=val_acc, phase="grpo",
-                    name=f"{machine_name}_grpo_e{epoch}_acc{val_acc:.3f}",
-                )
 
     yield {"type": "done", "best_grpo_acc": round(best_grpo_acc, 4)}

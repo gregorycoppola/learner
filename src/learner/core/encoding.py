@@ -2,16 +2,23 @@
 Token encoding for TM snapshots.
 
 Each tape cell becomes one token vector with slots:
-  - val:      1 bit  (the cell's current value, 0 or 1)
+  - val_oh:   3 bits (one-hot over {0, 1, _})
   - pos:      b bits (binary position encoding, ±1)
   - is_head:  1 bit  (1 if the TM head is here)
   - state:    S bits (one-hot over TM states)
 
-This follows the typed proposition encoding in the paper (Section 3).
-Total dim d = 1 + b + 1 + S where b = ceil(log2(tape_len)).
+Total dim d = 3 + b + 1 + S where b = ceil(log2(tape_len)).
+
+The 3-class value encoding matches TMTransformerCategorical.SYM2IDX:
+  "0" → [1, 0, 0]
+  "1" → [0, 1, 0]
+  "_" → [0, 0, 1]
 """
 import math
 import torch
+
+SYM2IDX = {"0": 0, "1": 1, "_": 2}
+IDX2SYM = {v: k for k, v in SYM2IDX.items()}
 
 
 def pos_encoding(j: int, b: int) -> list[float]:
@@ -34,25 +41,27 @@ def encode_snapshot(
     Encode a TM snapshot as a tensor of shape (n, d).
 
     n = tape length (padded to min_tape_len)
-    d = 1 + b + 1 + S
+    d = 3 + b + 1 + S
     """
-    # Pad tape
     n = max(len(tape), min_tape_len)
     padded = tape + [blank] * (n - len(tape))
 
     b = max(1, math.ceil(math.log2(n + 1)))
     S = len(state_index)
-    d = 1 + b + 1 + S
 
     tokens = []
     for j, sym in enumerate(padded):
-        val = [1.0 if sym == "1" else 0.0]
-        pos = pos_encoding(j, b)
+        # 3-class one-hot value encoding
+        val_oh = [0.0, 0.0, 0.0]
+        val_oh[SYM2IDX.get(sym, 2)] = 1.0
+
+        pos     = pos_encoding(j, b)
         is_head = [1.0 if j == head else 0.0]
         state_oh = [0.0] * S
         if state in state_index:
             state_oh[state_index[state]] = 1.0
-        token = val + pos + is_head + state_oh
+
+        token = val_oh + pos + is_head + state_oh
         tokens.append(token)
 
     return torch.tensor(tokens, dtype=torch.float32)  # (n, d)
@@ -66,28 +75,27 @@ def decode_snapshot(
     """
     Decode model output tensor (n, d) back to (tape, head, state).
 
-    val slot  -> threshold at 0.5
-    is_head   -> argmax over positions
-    state     -> argmax over state slots
+    val slots 0:3 -> argmax → symbol
+    is_head       -> argmax over positions
+    state         -> argmax over state slots
     """
     n, d = output.shape
     b = max(1, math.ceil(math.log2(n + 1)))
     S = len(state_index)
 
-    # val is slot 0
-    vals = output[:, 0]
-    tape = ["1" if v.item() > 0.5 else "0" for v in vals]
+    # val is slots 0:3
+    val_logits = output[:, 0:3]                        # (n, 3)
+    tape = [IDX2SYM[val_logits[j].argmax().item()] for j in range(n)]
 
-    # is_head is slot 1 + b
-    head_slot = 1 + b
+    # is_head is slot 3 + b
+    head_slot = 3 + b
     head = int(output[:, head_slot].argmax().item())
 
-    # state is slots (1 + b + 1) : (1 + b + 1 + S)
-    state_start = 1 + b + 1
+    # state is slots (3 + b + 1) : (3 + b + 1 + S)
+    state_start  = 3 + b + 1
     state_logits = output[:, state_start:state_start + S]
-    # average over positions (all tokens carry the same state signal)
-    state_avg = state_logits.mean(dim=0)
-    state_idx = int(state_avg.argmax().item())
+    state_avg    = state_logits.mean(dim=0)
+    state_idx    = int(state_avg.argmax().item())
 
     index_state = {v: k for k, v in state_index.items()}
     state = index_state.get(state_idx, "unknown")
@@ -107,7 +115,7 @@ def batch_encode(
       inputs:  (B, n, d)
       targets: (B, n, d)
     """
-    inputs = []
+    inputs  = []
     targets = []
 
     for pair in pairs:
